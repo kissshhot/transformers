@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pickle # 将第一次识别到的agent都保存到本地，在之后的运行过程中就不需要在运行识别程序
+import os
 
 import copy
 import inspect
@@ -1374,7 +1376,7 @@ class GenerationMixin:
                 inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
             )
 
-        # decoder-only models should use left-padding for generation
+        # decoder-only models should use left-padding for generation # peftmodel会警告这个
         if not self.config.is_encoder_decoder:
             # If `input_ids` was given, check if the last id in any sequence is `pad_token_id`
             # Note: If using, `inputs_embeds` this check does not work, because we want to be more hands-off.
@@ -2343,6 +2345,12 @@ class GenerationMixin:
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
         this_peer_finished = False  # used by synced_gpus only
+        participants_flag = False # 记录是否识别到了participants关键字
+        # agent_get_string = False # 记录是否已经分割完了agent
+        have_loaded = False
+        string_list = [] #保存agent的string形式，两个为一对，第二个加上换行符
+        string_list_ids = [] #保存agent的tensor形式
+        #这个循环会一直迭代到输出全部内容
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -2402,6 +2410,92 @@ class GenerationMixin:
 
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            # 本地还不存在agent文件，证明是第一次跑，把agent找出来
+            if not os.path.exists('agent_string.pkl'):
+                # 找到Participants关键字，分割角色
+                participant = torch.load('participants.pt')
+                if torch.equal(participant[0], input_ids[0][-3:]):
+                    participants_flag = True
+                    agent_start = input_ids[0].size(0)
+                if participants_flag:
+                    #首先识别第一个换行符
+                    turn_line = torch.load('line.pt')
+                    if torch.equal(turn_line[0][1], input_ids[0][-1]):
+                        participants_flag = False
+                        all_agent = input_ids[0][agent_start:-1]
+                        # to do 加载tokenizer将agent分割
+                        from transformers import AutoTokenizer
+                        tokenizer1 = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+                        string_agents = tokenizer1.decode(all_agent)
+                        string_list_pre = string_agents.split('; ')
+                        string_list_pre2 = string_agents.split(', ')
+                        if len(string_list_pre) < len(string_list_pre2):
+                            string_list_pre = string_list_pre2
+                        for i in string_list_pre:
+                            string_list.append(i)
+                            i = i + ':'
+                            string_list_ids.append(tokenizer1.encode(i, return_tensors='pt', add_special_tokens=False).to('cuda')[0])
+                            tmp = '\n' + i
+                            string_list.append(tmp)
+                            string_list_ids.append(tokenizer1.encode(tmp, return_tensors='pt', add_special_tokens=False).to('cuda')[0][1:])#获得了agent的string和tensor，这里直接把换行符前面的空格去掉了
+                        #在第一次拿到agent列表后，存入本地
+                        with open('agent_string.pkl', 'wb') as f:
+                            pickle.dump(string_list, f)
+                        with open('agent_tensor.pkl', 'wb') as f:
+                            pickle.dump(string_list_ids, f)
+                # 第一次先直接进循环找下一个agent
+                # 此段代码好像不需要
+                for j in range(0, len(string_list_ids)):
+                    if torch.equal(string_list_ids[j], input_ids[0][-(string_list_ids[j].size(0)):]):
+                        input_ids.to('cuda')
+                        torch.save(input_ids, 'tensor.pt')
+                        # torch.save(agent_test_1, 'agent_use.pt')
+                        if j == 0 or j == 1:#匹配到了AI Assistant
+                            return input_ids, 'Assistant'
+                        else:
+                            if j % 2 == 0:
+                                return input_ids, string_list[j]
+                            else:
+                                return input_ids, string_list[j-1]
+            else: #本地已经有文件，可以直接读取然后查找agent
+                #如果还没有读取过
+                if not have_loaded:
+                    with open('agent_string.pkl', 'rb') as f:
+                        string_list = pickle.load(f)
+                    with open('agent_tensor.pkl', 'rb') as f:
+                        string_list_ids = pickle.load(f)
+                    #置为True，下次循环不需要再读取一次
+                    have_loaded = True
+                #如果匹配到了某个角色
+                # agent_test = torch.load('agent.pt')
+                # agent_test_1 = torch.load('agent1.pt')
+                # if n_num == 0:
+                #     print(agent_test[0])
+                #     print(agent_test_1[0])
+                #     n_num = n_num + 1
+                # 如果已经分割完了agent
+                #查找是否匹配到了final_answer关键字，如果匹配到了则让基础模型去回答
+                final_answer = torch.load('final_answer.pt')
+                final_answer_line = torch.load('final_answer_line.pt')
+                if torch.equal(final_answer[0], input_ids[0][-3:]) or torch.equal(final_answer_line[0][1:], input_ids[0][-4:]):
+                    input_ids.to('cuda')
+                    torch.save(input_ids, 'tensor.pt')
+                    return input_ids, 'final_answer'
+                #循环查找是否匹配到了某个角色（注意这里AI Assistant(you)也需要作为一个角色，用以截停lora，这里应该是在list的前两位）
+                for j in range(0, len(string_list_ids)):
+                    if torch.equal(string_list_ids[j], input_ids[0][-(string_list_ids[j].size(0)):]):
+                        input_ids.to('cuda')
+                        torch.save(input_ids, 'tensor.pt')
+                        # torch.save(agent_test_1, 'agent_use.pt')
+                        if j == 0 or j == 1:#匹配到了AI Assistant
+                            return input_ids, 'Assistant'
+                        else:
+                            if j % 2 == 0:
+                                return input_ids, string_list[j]
+                            else:
+                                return input_ids, string_list[j-1]
+            
+            
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -2449,7 +2543,9 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids
+            input_ids.to('cuda')
+            torch.save(input_ids, 'tensor.pt')
+            return input_ids, ''
 
     def sample(
         self,
@@ -2625,6 +2721,13 @@ class GenerationMixin:
 
         this_peer_finished = False  # used by synced_gpus only
         # auto-regressive generation
+        n_num = 0 # 记录第一次迭代
+        participants_flag = False # 记录是否识别到了participants关键字
+        # agent_get_string = False # 记录是否已经分割完了agent
+        have_loaded = False
+        string_list = [] #保存agent的string形式，两个为一对，第二个加上换行符
+        string_list_ids = [] #保存agent的tensor形式
+        #这个循环会一直迭代到输出全部内容
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -2686,6 +2789,95 @@ class GenerationMixin:
 
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            # 本地还不存在agent文件，证明是第一次跑，把agent找出来
+            if not os.path.exists('agent_string.pkl'):
+                # 找到Participants关键字，分割角色
+                participant = torch.load('participants.pt')
+                if torch.equal(participant[0], input_ids[0][-3:]):
+                    participants_flag = True
+                    agent_start = input_ids[0].size(0)
+                if participants_flag:
+                    #首先识别第一个换行符
+                    turn_line = torch.load('line.pt')
+                    if torch.equal(turn_line[0][1], input_ids[0][-1]):
+                        participants_flag = False
+                        all_agent = input_ids[0][agent_start:-1]
+                        # to do 加载tokenizer将agent分割
+                        from transformers import AutoTokenizer
+                        tokenizer1 = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+                        string_agents = tokenizer1.decode(all_agent)
+                        string_list_pre = string_agents.split('; ')
+                        string_list_pre2 = string_agents.split(', ')
+                        if len(string_list_pre) < len(string_list_pre2):
+                            string_list_pre = string_list_pre2
+                        for i in string_list_pre:
+                            string_list.append(i)
+                            i = i + ':'
+                            string_list_ids.append(tokenizer1.encode(i, return_tensors='pt', add_special_tokens=False).to('cuda')[0])
+                            tmp = '\n' + i
+                            string_list.append(tmp)
+                            string_list_ids.append(tokenizer1.encode(tmp, return_tensors='pt', add_special_tokens=False).to('cuda')[0][1:])#获得了agent的string和tensor，这里直接把换行符前面的空格去掉了
+                        #在第一次拿到agent列表后，存入本地
+                        with open('agent_string.pkl', 'wb') as f:
+                            pickle.dump(string_list, f)
+                        with open('agent_tensor.pkl', 'wb') as f:
+                            pickle.dump(string_list_ids, f)
+                # 第一次先直接进循环找下一个agent
+                # 此段代码好像不需要
+                for j in range(0, len(string_list_ids)):
+                    if torch.equal(string_list_ids[j], input_ids[0][-(string_list_ids[j].size(0)):]):
+                        input_ids.to('cuda')
+                        torch.save(input_ids, 'tensor.pt')
+                        # torch.save(agent_test_1, 'agent_use.pt')
+                        if j == 0 or j == 1:#匹配到了AI Assistant
+                            return input_ids, 'Assistant'
+                        else:
+                            if j % 2 == 0:
+                                return input_ids, string_list[j]
+                            else:
+                                return input_ids, string_list[j-1]
+            else: #本地已经有文件，可以直接读取然后查找agent
+                #如果还没有读取过
+                if not have_loaded:
+                    with open('agent_string.pkl', 'rb') as f:
+                        string_list = pickle.load(f)
+                    with open('agent_tensor.pkl', 'rb') as f:
+                        string_list_ids = pickle.load(f)
+                    #置为True，下次循环不需要再读取一次
+                    have_loaded = True
+                #如果匹配到了某个角色
+                # agent_test = torch.load('agent.pt')
+                # agent_test_1 = torch.load('agent1.pt')
+                # if n_num == 0:
+                #     print(agent_test[0])
+                #     print(agent_test_1[0])
+                #     n_num = n_num + 1
+                # 如果已经分割完了agent
+                #查找是否匹配到了final_answer关键字，如果匹配到了则让基础模型去回答
+                final_answer = torch.load('final_answer.pt')
+                final_answer_line = torch.load('final_answer_line.pt')
+                if torch.equal(final_answer[0], input_ids[0][-3:]) or torch.equal(final_answer_line[0][1:], input_ids[0][-4:]):
+                    input_ids.to('cuda')
+                    torch.save(input_ids, 'tensor.pt')
+                    return input_ids, 'final_answer'
+                #循环查找是否匹配到了某个角色（注意这里AI Assistant(you)也需要作为一个角色，用以截停lora，这里应该是在list的前两位）
+                for j in range(0, len(string_list_ids)):
+                    if torch.equal(string_list_ids[j], input_ids[0][-(string_list_ids[j].size(0)):]):
+                        input_ids.to('cuda')
+                        torch.save(input_ids, 'tensor.pt')
+                        # torch.save(agent_test_1, 'agent_use.pt')
+                        if j == 0 or j == 1:#匹配到了AI Assistant
+                            return input_ids, 'Assistant'
+                        else:
+                            if j % 2 == 0:
+                                return input_ids, string_list[j]
+                            else:
+                                return input_ids, string_list[j-1]
+
+            # if torch.equal(agent_test[0][1:], input_ids[0][-5:]) or torch.equal(agent_test_1[0], input_ids[0][-4:]):
+            #     torch.save(input_ids, 'tensor.pt')
+            #     torch.save(agent_test_1, 'agent_use.pt')
+            #     return input_ids
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -2733,7 +2925,10 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids
+            #只有任务完成的时候才会从这里返回，保险起见也是先保存一下
+            input_ids.to('cuda')
+            torch.save(input_ids, 'tensor.pt')
+            return input_ids, ''
 
     def _temporary_reorder_cache(self, past_key_values, beam_idx):
         """
